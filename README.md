@@ -6,6 +6,8 @@ running Claude Code and Codex agents. It discovers their processes through
 or has unknown activity. Activity comes from optional hooks, never from CPU
 usage or elapsed time.
 
+The current Agentd product release is v0.3.3.
+
 Use `agentd list` for a snapshot or `agentd watch --json` to subscribe to changes.
 Each update contains the complete current roster. Agentd uses a local Unix
 socket and does not read prompts, transcripts, or terminal contents.
@@ -27,13 +29,13 @@ and HTTP endpoints. Agentd works independently of hub.
 ### Install a release
 
 Download a tagged build from [GitHub Releases](https://github.com/clickety-clacks/agentd/releases).
-This example installs v0.3.2. Run the steps in one shell session.
+This example installs v0.3.3. Run the steps in one shell session.
 
 1. Download the archive and checksum file:
 
    ```sh
    cd "$(mktemp -d)"
-   ver=0.3.2
+   ver=0.3.3
    archive="agentd-${ver}-x86_64-unknown-linux-gnu"
    base="https://github.com/clickety-clacks/agentd/releases/download/v${ver}"
    curl -fsSLO "${base}/${archive}.tar.gz"
@@ -421,7 +423,7 @@ scripts/package-release.sh
 ```
 
 The package command writes
-`target/release-assets/agentd-0.3.2-<rust-host>.tar.gz` and
+`target/release-assets/agentd-0.3.3-<rust-host>.tar.gz` and
 `target/release-assets/SHA256SUMS`. The archive contains the binary, this
 README, the systemd user unit, and `skills/agentd/SKILL.md`. It assigns fixed
 file modes, sorts archive entries, removes the gzip timestamp, and uses the
@@ -436,7 +438,7 @@ scripts/package-release.sh --output-dir target/release-assets-b
 cmp target/release-assets-a/*.tar.gz target/release-assets-b/*.tar.gz
 ```
 
-Packaging creates local v0.3.2 candidate files only. It does not publish a
+Packaging creates local v0.3.3 candidate files only. It does not publish a
 release, install Agentd, install the operator skill, or change an earlier
 release.
 
