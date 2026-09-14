@@ -1,94 +1,116 @@
-# agentd
+# Agentd
 
-`agentd` is a Linux user service that reports a truthful local roster of running
-Codex and Claude coding-agent processes. It observes process existence through
-`/proc`. Optional activity messages enrich an existing record but never create
-or preserve one.
+Agentd is a Linux user service that gives apps and tools a local roster of
+running Claude Code and Codex agents. It discovers their processes through
+`/proc` and reports whether each agent is working, idle, waiting for attention,
+or has unknown activity. Activity comes from optional hooks, never from CPU
+usage or elapsed time.
 
-The current Agentd product release is v0.3.2.
+Use `agentd list` for a snapshot or `agentd watch --json` to subscribe to changes.
+Each update contains the complete current roster. Agentd uses a local Unix
+socket and does not read prompts, transcripts, or terminal contents.
 
-For multi-machine aggregation, use [agentd-hub](https://github.com/clickety-clacks/agentd-hub).
+For a central view across your network, use the optional
+[Agentd Hub add-on](https://github.com/clickety-clacks/agentd-hub), maintained in
+a separate repository. Hub reads Agentd over SSH and provides a browser page
+and HTTP endpoints. Agentd works independently of hub.
 
-The daemon keeps one atomic in-memory snapshot. Local clients read or subscribe
-to complete snapshots through `$XDG_RUNTIME_DIR/agentd.sock`. Process identity
-is the pair of PID and Linux process start-time ticks. Unknown presence, working
-directory, activity, terminal, tmux location, display name, and process start
-time values stay explicit.
+## Installation
 
-## Build
+### Prerequisites
 
-Rust 1.97 or later is required.
+- Linux with `/proc` and a working systemd user manager.
+- x86-64 with glibc for the published binary.
+- `curl`, `tar`, and GNU coreutils for the commands below.
+- Claude Code or Codex processes running as the same user as Agentd.
+
+### Install a release
+
+Download a tagged build from [GitHub Releases](https://github.com/clickety-clacks/agentd/releases).
+This example installs v0.3.2. Run the steps in one shell session.
+
+1. Download the archive and checksum file:
+
+   ```sh
+   cd "$(mktemp -d)"
+   ver=0.3.2
+   archive="agentd-${ver}-x86_64-unknown-linux-gnu"
+   base="https://github.com/clickety-clacks/agentd/releases/download/v${ver}"
+   curl -fsSLO "${base}/${archive}.tar.gz"
+   curl -fsSLO "${base}/SHA256SUMS"
+   ```
+
+2. Verify the checksum and extract only if verification succeeds:
+
+   ```sh
+   sha256sum -c SHA256SUMS && tar xzf "${archive}.tar.gz"
+   ```
+
+3. Install the binary and systemd user unit:
+
+   ```sh
+   install -Dm755 "${archive}/agentd" "$HOME/.local/bin/agentd"
+   install -Dm644 "${archive}/packaging/systemd/agentd.service" \
+     "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/agentd.service"
+   export PATH="$HOME/.local/bin:$PATH"
+   systemctl --user daemon-reload
+   systemctl --user enable --now agentd.service
+   agentd --version
+   agentd list
+   ```
+
+Add `~/.local/bin` to your shell startup file's `PATH` for future sessions.
+The systemd user manager supplies `XDG_RUNTIME_DIR`. Agentd creates
+`$XDG_RUNTIME_DIR/agentd.sock` with mode `0600`.
+
+## Quick start
+
+Read the roster:
 
 ```sh
-cargo build --release --locked
+agentd list
 ```
 
-The build produces `target/release/agentd`.
-
-Print the Agentd product version:
+Subscribe to complete JSON snapshots:
 
 ```sh
-agentd --version
+agentd watch --json
 ```
 
-The v0.3.2 release prints `agentd 0.3.2`.
-
-## Package a release candidate
-
-Build the locked release binary, inspect the package plan, then create the
-deterministic archive and its checksum receipt:
+Press Ctrl+C to stop watching. Without activity hooks, discovered agents appear
+with activity `unknown`. Install the integration for the agent you use:
 
 ```sh
-cargo build --release --locked
-scripts/package-release.sh --dry-run
-scripts/package-release.sh
+agentd integrate install claude
+agentd integrate install codex
 ```
 
-The package command writes
-`target/release-assets/agentd-0.3.2-<rust-host>.tar.gz` and
-`target/release-assets/SHA256SUMS`. The archive contains the binary, this
-README, the systemd user unit, and `skills/agentd/SKILL.md`. It assigns fixed
-file modes, sorts archive entries, removes the gzip timestamp, and uses the
-source commit time for every archive timestamp.
+New hook declarations require restarting the agent while preserving its
+conversation. Codex also requires interactive hook trust approval. Follow the
+[Claude Code](#claude-code) or [Codex](#codex) instructions below for supported
+versions, activation, and removal.
 
-To prove reproduction, package twice from the same commit and binary into two
-output directories, then compare the archives:
+| Activity | Meaning |
+| --- | --- |
+| `active` | The latest accepted hook reports work started. |
+| `idle` | The latest accepted hook reports the turn ended. |
+| `needs_attention` | The latest accepted hook reports a need for user attention. |
+| `unknown` | No activity claim is available. This does not mean idle. |
 
-```sh
-scripts/package-release.sh --output-dir target/release-assets-a
-scripts/package-release.sh --output-dir target/release-assets-b
-cmp target/release-assets-a/*.tar.gz target/release-assets-b/*.tar.gz
-```
+Claims describe the latest reported event. They do not prove that an earlier
+request for attention still needs an answer.
 
-Packaging creates local v0.3.2 candidate files only. It does not publish a
-release, install Agentd, install the operator skill, or change an earlier
-release.
+## Discovery limits
 
-## Install the user service
+This release discovers Claude Code and Codex processes owned by the user running
+Agentd. It does not list in-process subagents or agents hosted inside another
+program as separate agents. Nested processes of the same agent type collapse
+into one root entry. Hub aggregates these rosters and does not expand discovery.
 
-```sh
-install -Dm755 target/release/agentd "$HOME/.local/bin/agentd"
-install -Dm644 packaging/systemd/agentd.service \
-  "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/agentd.service"
-systemctl --user daemon-reload
-systemctl --user enable --now agentd.service
-```
-
-The systemd user manager supplies `XDG_RUNTIME_DIR`. The service creates the
-socket at `$XDG_RUNTIME_DIR/agentd.sock` with mode `0600`.
-
-## Use the Agentd operator skill
-
-The source checkout contains the generic operator skill at
-`skills/agentd/SKILL.md`. A release archive keeps it at the same relative path
-under the archive's top-level directory.
-
-Each agent environment has its own documented skill discovery or installation
-mechanism. Follow that environment's documentation. Do not copy, link, import,
-or install this skill unless the user or installer explicitly authorizes that
-action. Never install it silently. Building Agentd, packaging a release,
-installing the service, and installing harness integrations do not install the
-skill.
+Process identity is the pair of PID and Linux process start-time ticks. Optional
+activity claims enrich an existing record but never create or preserve one.
+Unknown presence and metadata stay explicit. Agentd keeps one atomic in-memory
+snapshot and publishes complete snapshots through its local socket.
 
 ## Inspect and enrich the roster
 
@@ -349,6 +371,75 @@ rm "$HOME/.local/bin/agentd"
 
 The service stores no roster, revision, event, or activity history.
 
+## Use the Agentd operator skill
+
+The source checkout contains the generic operator skill at
+[skills/agentd/SKILL.md](skills/agentd/SKILL.md). A release archive keeps it at the same relative path
+under the archive's top-level directory.
+
+Each agent environment has its own documented skill discovery or installation
+mechanism. Follow that environment's documentation. Do not copy, link, import,
+or install this skill unless the user or installer explicitly authorizes that
+action. Never install it silently. Building Agentd, packaging a release,
+installing the service, and installing harness integrations do not install the
+skill.
+
+## Development
+
+Rust 1.97 or later is required. Build from a source checkout:
+
+```sh
+cargo build --release --locked
+```
+
+The binary is `target/release/agentd`. For deployments, use a published release.
+
+## Releasing
+
+The [release workflow](.github/workflows/release.yml) publishes GitHub releases
+when a matching `v*` tag is pushed.
+
+1. Update [Cargo.toml](Cargo.toml), the Agentd entry in [Cargo.lock](Cargo.lock),
+   and `AGENTD_RELEASE_VERSION` in [the packaging script](scripts/package-release.sh).
+2. Commit the changes, push to `main`, and wait for [CI](.github/workflows/ci.yml)
+   to pass.
+3. Tag that commit `vX.Y.Z` with the matching version and push the tag.
+
+CI checks tag, crate, and package version agreement; runs formatting, Clippy,
+and locked tests; builds the release binary; and packages it twice to compare
+archive bytes. It publishes the archive and `SHA256SUMS` as release assets.
+
+### Check packaging locally
+
+Build the locked release binary, inspect the package plan, then create the
+deterministic archive and its checksum receipt:
+
+```sh
+cargo build --release --locked
+scripts/package-release.sh --dry-run
+scripts/package-release.sh
+```
+
+The package command writes
+`target/release-assets/agentd-0.3.2-<rust-host>.tar.gz` and
+`target/release-assets/SHA256SUMS`. The archive contains the binary, this
+README, the systemd user unit, and `skills/agentd/SKILL.md`. It assigns fixed
+file modes, sorts archive entries, removes the gzip timestamp, and uses the
+source commit time for every archive timestamp.
+
+To prove reproduction, package twice from the same commit and binary into two
+output directories, then compare the archives:
+
+```sh
+scripts/package-release.sh --output-dir target/release-assets-a
+scripts/package-release.sh --output-dir target/release-assets-b
+cmp target/release-assets-a/*.tar.gz target/release-assets-b/*.tar.gz
+```
+
+Packaging creates local v0.3.2 candidate files only. It does not publish a
+release, install Agentd, install the operator skill, or change an earlier
+release.
+
 ## Verification
 
 Run each gate from a clean Linux checkout:
@@ -388,7 +479,7 @@ sentinels on Gibson and Osanwe.
 [The verification map](docs/verification.md) links each acceptance case to its
 automated or real-host proof and lists the real-smoke evidence files.
 
-## Version 1 boundaries
+## Scope
 
 Agentd does not provide remote or multi-host aggregation, a graphical or web
 interface, transcript handling, LLM calls of its own, agent steering, a plugin
@@ -396,3 +487,13 @@ or provider framework, macOS support, or Windows support. It does not
 authenticate process vendors, discover other users' processes, replay events,
 infer progress, or turn elapsed time into activity. Its only persistent state is
 the bounded same-boot exact-identity display-name registry.
+
+## Help and contributions
+
+Report bugs and request features through
+[GitHub Issues](https://github.com/clickety-clacks/agentd/issues). Include the
+Agentd version, command, and relevant error output when reporting a bug.
+
+To contribute, open a pull request describing the change. See
+[Verification](#verification) for the checks and
+[the verification map](docs/verification.md) for acceptance coverage.
