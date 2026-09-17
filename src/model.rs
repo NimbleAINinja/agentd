@@ -12,6 +12,7 @@ pub struct AgentId {
 pub enum Harness {
     Codex,
     Claude,
+    Opencode,
 }
 
 impl Harness {
@@ -19,6 +20,7 @@ impl Harness {
         match comm {
             "codex" => Some(Self::Codex),
             "claude" | "claude.exe" => Some(Self::Claude),
+            "opencode" => Some(Self::Opencode),
             _ => None,
         }
     }
@@ -27,6 +29,7 @@ impl Harness {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Opencode => "opencode",
         }
     }
 }

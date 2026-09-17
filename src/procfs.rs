@@ -852,6 +852,32 @@ mod tests {
     }
 
     #[test]
+    fn opencode_is_listed_and_resolves_hooks_spawned_directly_by_it() {
+        let procfs = TestProcfs::new("opencode");
+        procfs.write_process(1, "systemd", 0, 0, 0);
+        procfs.write_process(610, "opencode", 1, 6_100, 1000);
+        procfs.write_process(620, "bash", 1, 6_200, 1000);
+        let proposal = procfs.scanner().scan(None, &FixedClock(1));
+        assert_eq!(
+            proposal
+                .agents
+                .iter()
+                .map(|agent| (agent.id.pid, agent.harness))
+                .collect::<Vec<_>>(),
+            vec![(610, Harness::Opencode)]
+        );
+        // The opencode plugin spawns the hook itself, so the hook's parent
+        // is the opencode process rather than an intermediate shell.
+        assert_eq!(
+            procfs.scanner().resolve_hook_root(610, Harness::Opencode),
+            Ok(AgentId {
+                pid: 610,
+                start_time_ticks: 6_100,
+            })
+        );
+    }
+
+    #[test]
     fn hook_resolver_crosses_different_harness_candidates() {
         let procfs = TestProcfs::new("hook-cross-harness");
         procfs.write_process(510, "codex", 0, 5_100, 1000);

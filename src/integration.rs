@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const INTEGRATION_MARKER: &str = "agentd-v1.1";
 const VERIFIED_CODEX_VERSION: &str = "codex-cli 0.149.1";
+const VERIFIED_OPENCODE_VERSION: &str = "1.18.31";
+const OPENCODE_PLUGIN_TEMPLATE: &str = include_str!("opencode_plugin.js");
+const OPENCODE_PLUGIN_HEADER: &str = "// agentd-integration agentd-v1.1 harness=opencode\n";
+const OPENCODE_EXECUTABLE_PLACEHOLDER: &str = "__AGENTD_EXECUTABLE__";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +38,7 @@ impl Action {
 enum IntegrationHarness {
     Claude,
     Codex,
+    Opencode,
 }
 
 impl IntegrationHarness {
@@ -41,6 +46,7 @@ impl IntegrationHarness {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Opencode => "opencode",
         }
     }
 
@@ -48,6 +54,7 @@ impl IntegrationHarness {
         crate::hook::mappings_for(match self {
             Self::Claude => crate::model::Harness::Claude,
             Self::Codex => crate::model::Harness::Codex,
+            Self::Opencode => crate::model::Harness::Opencode,
         })
     }
 }
@@ -89,6 +96,7 @@ pub fn run(action: &str, harness: &str) -> Result<(), String> {
     let harness = match harness {
         "claude" => IntegrationHarness::Claude,
         "codex" => IntegrationHarness::Codex,
+        "opencode" => IntegrationHarness::Opencode,
         _ => return Err("agentd integrate: invalid_harness".to_owned()),
     };
     let executable = env::current_exe()
@@ -98,6 +106,9 @@ pub fn run(action: &str, harness: &str) -> Result<(), String> {
         .ok_or_else(|| "agentd integrate: unresolved_agentd_executable".to_owned())?;
     if executable.to_str().is_none() {
         return Err("agentd integrate: unresolved_agentd_executable".to_owned());
+    }
+    if harness == IntegrationHarness::Opencode {
+        return run_opencode(action, &executable);
     }
     let target = target_path(harness)?;
     validate_configuration_directory(&target)?;
@@ -117,6 +128,9 @@ fn target_path(harness: IntegrationHarness) -> Result<PathBuf, String> {
     let (variable, default_suffix, file_name) = match harness {
         IntegrationHarness::Claude => ("CLAUDE_CONFIG_DIR", ".claude", "settings.json"),
         IntegrationHarness::Codex => ("CODEX_HOME", ".codex", "hooks.json"),
+        IntegrationHarness::Opencode => {
+            unreachable!("opencode is integrated through a plugin file")
+        }
     };
     let directory = match env::var_os(variable) {
         Some(value) => {
@@ -513,6 +527,9 @@ fn handler(harness: IntegrationHarness, event: &str, executable: &Path) -> Value
         IntegrationHarness::Codex => {
             json!({"type": "command", "command": command, "timeout": 1, "async": false})
         }
+        IntegrationHarness::Opencode => {
+            unreachable!("opencode is integrated through a plugin file")
+        }
     }
 }
 
@@ -646,7 +663,7 @@ fn print_result(
     harness: IntegrationHarness,
     target: &Path,
     result: &MutationResult,
-    codex_version: Option<&str>,
+    version: Option<&str>,
 ) {
     let result_name = if result.changed {
         "changed"
@@ -677,7 +694,7 @@ fn print_result(
                 line.push_str(
                     " existing_process=kept_by_procfs activity=unchanged next_activity=accepted_mapped_hook_event activation=restart_only resume=\"codex resume\" trust=next_interactive_startup_review",
                 );
-                if let Some(version) = codex_version
+                if let Some(version) = version
                     && version != VERIFIED_CODEX_VERSION
                 {
                     line.push_str(&format!(
@@ -685,9 +702,190 @@ fn print_result(
                     ));
                 }
             }
+            IntegrationHarness::Opencode => {
+                line.push_str(
+                    " existing_process=kept_by_procfs activity=unchanged next_activity=accepted_mapped_plugin_event activation=restart_only resume=\"opencode --continue\"",
+                );
+                if let Some(version) = version
+                    && version != VERIFIED_OPENCODE_VERSION
+                {
+                    line.push_str(&format!(
+                        " warning=unverified_opencode_version version={version}"
+                    ));
+                }
+            }
         }
     }
     println!("{line}");
+}
+
+fn run_opencode(action: Action, executable: &Path) -> Result<(), String> {
+    let plugins = opencode_config_directory()?.join("plugins");
+    // Validates the opencode configuration directory itself.
+    validate_configuration_directory(&plugins)?;
+    let target = plugins.join("agentd.js");
+    let version = if action == Action::Install {
+        let version = check_opencode()?;
+        match fs::create_dir(&plugins) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "agentd integrate: invalid_configuration_directory path={} cause={error}",
+                    plugins.display()
+                ));
+            }
+        }
+        Some(version)
+    } else {
+        None
+    };
+    let result = if action == Action::Uninstall && !plugins.exists() {
+        MutationResult {
+            changed: false,
+            not_removed: Vec::new(),
+        }
+    } else {
+        validate_configuration_directory(&target)?;
+        let desired = match action {
+            Action::Install => Some(opencode_plugin(executable)),
+            Action::Uninstall => None,
+        };
+        mutate_opencode_plugin(&target, desired.as_deref(), |_, _| {})?
+    };
+    print_result(
+        action,
+        IntegrationHarness::Opencode,
+        &target,
+        &result,
+        version.as_deref(),
+    );
+    Ok(())
+}
+
+fn opencode_config_directory() -> Result<PathBuf, String> {
+    for (variable, suffix) in [("OPENCODE_CONFIG_DIR", ""), ("XDG_CONFIG_HOME", "opencode")] {
+        if let Some(value) = env::var_os(variable) {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "agentd integrate: relative_configuration_directory variable={variable}"
+                ));
+            }
+            return Ok(path.join(suffix));
+        }
+    }
+    let home = env::var_os("HOME")
+        .ok_or_else(|| "agentd integrate: home_directory_unavailable".to_owned())?;
+    Ok(PathBuf::from(home).join(".config").join("opencode"))
+}
+
+fn check_opencode() -> Result<String, String> {
+    let output = Command::new("opencode")
+        .arg("--version")
+        .output()
+        .map_err(|_| "agentd integrate: unsupported_opencode".to_owned())?;
+    if !output.status.success() {
+        return Err("agentd integrate: unsupported_opencode".to_owned());
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "agentd integrate: unsupported_opencode".to_owned())
+}
+
+fn opencode_plugin(executable: &Path) -> Vec<u8> {
+    let executable = serde_json::to_string(
+        executable
+            .to_str()
+            .expect("the executable path was validated as UTF-8"),
+    )
+    .expect("string serialization cannot fail");
+    OPENCODE_PLUGIN_TEMPLATE
+        .replace(OPENCODE_EXECUTABLE_PLACEHOLDER, &executable)
+        .into_bytes()
+}
+
+/// Installs (`desired` is `Some`) or removes the Agentd-owned opencode
+/// plugin. A file without the Agentd header belongs to someone else and is
+/// never replaced or removed.
+fn mutate_opencode_plugin<O>(
+    target: &Path,
+    desired: Option<&[u8]>,
+    mut before_reread: O,
+) -> Result<MutationResult, String>
+where
+    O: FnMut(usize, &Path),
+{
+    let effective_uid = unsafe { libc::geteuid() as u32 };
+    for attempt in 0..=1 {
+        let baseline = read_configuration(target, effective_uid)?;
+        let unchanged = |not_removed| {
+            Ok(MutationResult {
+                changed: false,
+                not_removed,
+            })
+        };
+        match (&baseline, desired) {
+            (ConfigurationRead::Absent, None) => return unchanged(Vec::new()),
+            (ConfigurationRead::Present { bytes, .. }, Some(desired)) if bytes == desired => {
+                return unchanged(Vec::new());
+            }
+            (ConfigurationRead::Present { bytes, .. }, _)
+                if !bytes.starts_with(OPENCODE_PLUGIN_HEADER.as_bytes()) =>
+            {
+                if desired.is_some() {
+                    return Err(format!(
+                        "agentd integrate: unowned_configuration_target path={}",
+                        target.display()
+                    ));
+                }
+                return unchanged(vec![NotRemoved {
+                    path: target.display().to_string(),
+                    event: "plugin".to_owned(),
+                }]);
+            }
+            _ => {}
+        }
+
+        let candidate = match desired {
+            Some(desired) => {
+                let mut candidate = TemporaryCandidate::create(target)?;
+                candidate.write_and_flush(desired)?;
+                Some(candidate)
+            }
+            None => None,
+        };
+        before_reread(attempt, target);
+        if read_configuration(target, effective_uid)? != baseline {
+            drop(candidate);
+            if attempt == 0 {
+                continue;
+            }
+            return Err(format!(
+                "agentd integrate: configuration_changed path={}",
+                target.display()
+            ));
+        }
+        match candidate {
+            Some(mut candidate) => {
+                candidate.preserve_target_mode(&baseline)?;
+                candidate.commit(target)?;
+            }
+            None => fs::remove_file(target).map_err(|error| {
+                format!(
+                    "agentd integrate: remove_plugin path={} cause={error}",
+                    target.display()
+                )
+            })?,
+        }
+        return Ok(MutationResult {
+            changed: true,
+            not_removed: Vec::new(),
+        });
+    }
+    unreachable!("the bounded mutation loop returns on its second attempt")
 }
 
 struct TemporaryCandidate {
@@ -931,6 +1129,104 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn opencode_plugin_install_and_uninstall_are_idempotent() {
+        let directory = TestDir::new("opencode");
+        let target = directory.0.join("agentd.js");
+        let plugin = opencode_plugin(Path::new("/opt/agent d/agentd"));
+        let text = String::from_utf8(plugin.clone()).unwrap();
+        assert!(text.starts_with(OPENCODE_PLUGIN_HEADER));
+        assert!(text.contains(r#"const AGENTD = "/opt/agent d/agentd";"#));
+        assert!(!text.contains(OPENCODE_EXECUTABLE_PLACEHOLDER));
+        for (event, _) in IntegrationHarness::Opencode.events() {
+            assert!(
+                text.contains(&format!("\"{event}\"")),
+                "plugin never fires {event}"
+            );
+        }
+
+        let install = |bytes: &[u8]| mutate_opencode_plugin(&target, Some(bytes), |_, _| {});
+        assert!(install(&plugin).unwrap().changed);
+        assert_eq!(fs::read(&target).unwrap(), plugin);
+        assert!(!install(&plugin).unwrap().changed);
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let moved = opencode_plugin(Path::new("/new/agentd"));
+        assert!(install(&moved).unwrap().changed);
+        assert_eq!(fs::read(&target).unwrap(), moved);
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+
+        let uninstall = || mutate_opencode_plugin(&target, None, |_, _| {});
+        let removed = uninstall().unwrap();
+        assert!(removed.changed);
+        assert!(removed.not_removed.is_empty());
+        assert!(!target.exists());
+        assert!(!uninstall().unwrap().changed);
+        assert_eq!(
+            fs::read_dir(&directory.0).unwrap().count(),
+            0,
+            "no candidate files are left behind"
+        );
+    }
+
+    #[test]
+    fn opencode_plugin_never_replaces_or_removes_an_unowned_file() {
+        let directory = TestDir::new("opencode-unowned");
+        let target = directory.0.join("agentd.js");
+        let foreign = b"export const Mine = async () => ({})\n";
+        fs::write(&target, foreign).unwrap();
+
+        let error = mutate_opencode_plugin(
+            &target,
+            Some(&opencode_plugin(Path::new("/opt/agentd"))),
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("unowned_configuration_target"));
+        let kept = mutate_opencode_plugin(&target, None, |_, _| {}).unwrap();
+        assert!(!kept.changed);
+        assert_eq!(kept.not_removed.len(), 1);
+        assert_eq!(fs::read(&target).unwrap(), foreign);
+    }
+
+    #[test]
+    fn opencode_plugin_refuses_symlinks_and_rechecks_concurrent_changes() {
+        let directory = TestDir::new("opencode-race");
+        let target = directory.0.join("agentd.js");
+        let referent = directory.0.join("elsewhere.js");
+        fs::write(&referent, b"keep").unwrap();
+        symlink(&referent, &target).unwrap();
+        let plugin = opencode_plugin(Path::new("/opt/agentd"));
+        let error = mutate_opencode_plugin(&target, Some(&plugin), |_, _| {}).unwrap_err();
+        assert!(error.contains("unsupported_configuration_target"));
+        assert_eq!(fs::read(&referent).unwrap(), b"keep");
+        fs::remove_file(&target).unwrap();
+
+        // A foreign file appearing mid-install is noticed and left alone.
+        let error = mutate_opencode_plugin(&target, Some(&plugin), |attempt, path| {
+            if attempt == 0 {
+                fs::write(path, b"foreign").unwrap();
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("unowned_configuration_target"));
+        assert_eq!(fs::read(&target).unwrap(), b"foreign");
+
+        // An owned file rewritten mid-uninstall twice is refused, not removed.
+        fs::write(&target, &plugin).unwrap();
+        let error = mutate_opencode_plugin(&target, None, |attempt, path| {
+            let mut bytes = plugin.clone();
+            bytes.extend_from_slice(format!("// {attempt}\n").as_bytes());
+            fs::write(path, bytes).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.contains("configuration_changed"));
+        assert!(target.exists());
     }
 
     fn exercise_idempotence(harness: IntegrationHarness, file_name: &str) {

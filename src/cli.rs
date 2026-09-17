@@ -67,7 +67,7 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
             crate::integration::run(action, harness)
         }
         _ => Err(
-            "agentd usage failed: expected --version | daemon | list [--json] | watch [--json] | activity --pid <positive-integer> --state active|idle|needs_attention | name --pid <positive-integer> <NAME>|--clear | name --from-claude-session-start <NAME> | hook --integration agentd-v1.1 --harness <claude|codex> --event <event> | integrate <install|uninstall> <claude|codex>"
+            "agentd usage failed: expected --version | daemon | list [--json] | watch [--json] | activity --pid <positive-integer> --state active|idle|needs_attention | name --pid <positive-integer> <NAME>|--clear | name --from-claude-session-start <NAME> | hook --integration agentd-v1.1 --harness <claude|codex|opencode> --event <event> | integrate <install|uninstall> <claude|codex|opencode>"
                 .to_owned(),
         ),
     }

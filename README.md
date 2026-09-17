@@ -1,7 +1,7 @@
 # Agentd
 
 Agentd is a Linux user service that gives apps and tools a local roster of
-running Claude Code and Codex agents. It discovers their processes through
+running Claude Code, Codex, and opencode agents. It discovers their processes through
 `/proc` and reports whether each agent is working, idle, waiting for attention,
 or has unknown activity. Activity comes from optional hooks, never from CPU
 usage or elapsed time.
@@ -24,7 +24,7 @@ and HTTP endpoints. Agentd works independently of hub.
 - Linux with `/proc` and a working systemd user manager.
 - x86-64 with glibc for the published binary.
 - `curl`, `tar`, and GNU coreutils for the commands below.
-- Claude Code or Codex processes running as the same user as Agentd.
+- Claude Code, Codex, or opencode processes running as the same user as Agentd.
 
 ### Install a release
 
@@ -85,11 +85,13 @@ with activity `unknown`. Install the integration for the agent you use:
 ```sh
 agentd integrate install claude
 agentd integrate install codex
+agentd integrate install opencode
 ```
 
 New hook declarations require restarting the agent while preserving its
 conversation. Codex also requires interactive hook trust approval. Follow the
-[Claude Code](#claude-code) or [Codex](#codex) instructions below for supported
+[Claude Code](#claude-code), [Codex](#codex), or [opencode](#opencode)
+instructions below for supported
 versions, activation, and removal.
 
 | Activity | Meaning |
@@ -104,7 +106,7 @@ request for attention still needs an answer.
 
 ## Discovery limits
 
-This release discovers Claude Code and Codex processes owned by the user running
+This release discovers Claude Code, Codex, and opencode processes owned by the user running
 Agentd. It does not list in-process subagents or agents hosted inside another
 program as separate agents. Nested processes of the same agent type collapse
 into one root entry. Hub aggregates these rosters and does not expand discovery.
@@ -200,7 +202,8 @@ location, and cwd basename. They retain the legacy raw full path or literal
 
 ## Install harness activity integrations
 
-Agentd can install user-level command hooks for Claude Code and Codex. These
+Agentd can install user-level command hooks for Claude Code and Codex, and a
+plugin that runs the same hook command for opencode. These
 hooks enrich a procfs-discovered roster entry. They never create a roster entry.
 They discard the complete hook payload and send only the mapped activity claim
 for the exact process identity. If Agentd is unavailable, a hook prints one
@@ -322,6 +325,50 @@ reports `result=changed` when entries existed. The second reports
 ```sh
 agentd integrate uninstall codex
 agentd integrate uninstall codex
+```
+
+### opencode
+
+The verified baseline is opencode `1.18.31`. opencode has no command hooks, so
+Agentd writes one plugin file that it owns completely:
+`$OPENCODE_CONFIG_DIR/plugins/agentd.js` when `OPENCODE_CONFIG_DIR` is set,
+otherwise `$XDG_CONFIG_HOME/opencode/plugins/agentd.js`, or
+`$HOME/.config/opencode/plugins/agentd.js`. The configuration directory must
+already exist; install creates `plugins/` inside it when needed. Install runs
+`opencode --version`; a missing command returns `unsupported_opencode`, and
+another version proceeds with `warning=unverified_opencode_version`.
+
+```sh
+agentd integrate install opencode
+```
+
+The plugin runs `agentd hook --harness opencode` as a direct child of the
+opencode process for the events below. It sends one `active` claim per two
+seconds at most while work continues, and it reports `idle` only when no
+session in the process, including subagent sessions, is still busy.
+Activation is restart-only; restart with `opencode --continue`. One opencode
+process can switch between sessions, and its roster entry carries the latest
+claim from any of them. An `opencode attach` client is discovered as its own
+agent but never receives plugin events, so it stays `unknown`.
+
+| opencode event | Hook event | Agentd activity claim |
+| --- | --- | --- |
+| `chat.message` | `PromptSubmit` | `active` |
+| `tool.execute.before` | `ToolBefore` | `active` |
+| `session.status` busy | `Busy` | `active` |
+| `permission.replied`, `question.replied`, `question.rejected` | `Replied` | `active` |
+| `permission.asked`, `permission.updated` | `PermissionAsked` | `needs_attention` |
+| `question.asked` | `QuestionAsked` | `needs_attention` |
+| `session.idle`, `session.status` idle | `Idle` | `idle` |
+
+The first line of the plugin marks it as Agentd-owned. Install rewrites only an
+owned file and refuses any other file at that path with
+`unowned_configuration_target`. Uninstall deletes only an owned file and
+reports any other file as not removed.
+
+```sh
+agentd integrate uninstall opencode
+agentd integrate uninstall opencode
 ```
 
 ### Mutation and uninstall guarantees

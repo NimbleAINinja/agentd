@@ -36,6 +36,7 @@ fn replays_four_real_shared_cwd_processes() {
         match Harness::from_comm(&stat.comm).unwrap() {
             Harness::Codex => codex += 1,
             Harness::Claude => claude += 1,
+            Harness::Opencode => panic!("the captured fixture has no opencode process"),
         }
     }
     assert_eq!(codex, 3);

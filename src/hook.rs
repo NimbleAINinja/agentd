@@ -24,6 +24,17 @@ const CODEX_MAPPINGS: &[(&str, ActivityState)] = &[
     ("PermissionRequest", ActivityState::NeedsAttention),
     ("Stop", ActivityState::Idle),
 ];
+// opencode has no command hooks; the plugin written by `agentd integrate
+// install opencode` translates its plugin events into these names.
+const OPENCODE_MAPPINGS: &[(&str, ActivityState)] = &[
+    ("PromptSubmit", ActivityState::Active),
+    ("ToolBefore", ActivityState::Active),
+    ("Busy", ActivityState::Active),
+    ("Replied", ActivityState::Active),
+    ("PermissionAsked", ActivityState::NeedsAttention),
+    ("QuestionAsked", ActivityState::NeedsAttention),
+    ("Idle", ActivityState::Idle),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HookError {
@@ -75,6 +86,7 @@ fn mapping(harness: &str, event: &str) -> Option<(Harness, ActivityState)> {
     let harness = match harness {
         "claude" => Harness::Claude,
         "codex" => Harness::Codex,
+        "opencode" => Harness::Opencode,
         _ => return None,
     };
     mappings_for(harness)
@@ -87,6 +99,7 @@ pub(crate) fn mappings_for(harness: Harness) -> &'static [(&'static str, Activit
     match harness {
         Harness::Claude => CLAUDE_MAPPINGS,
         Harness::Codex => CODEX_MAPPINGS,
+        Harness::Opencode => OPENCODE_MAPPINGS,
     }
 }
 
@@ -324,5 +337,15 @@ mod tests {
         );
         assert_eq!(mapping("codex", "Notification"), None);
         assert_eq!(mapping("claude", "PermissionRequest"), None);
+        assert_eq!(
+            mapping("opencode", "PermissionAsked"),
+            Some((Harness::Opencode, ActivityState::NeedsAttention))
+        );
+        assert_eq!(
+            mapping("opencode", "Idle"),
+            Some((Harness::Opencode, ActivityState::Idle))
+        );
+        assert_eq!(mapping("opencode", "Stop"), None);
+        assert_eq!(mapping("claude", "Idle"), None);
     }
 }
