@@ -109,7 +109,12 @@ request for attention still needs an answer.
 This release discovers Claude Code, Codex, and opencode processes owned by the user running
 Agentd. It does not list in-process subagents or agents hosted inside another
 program as separate agents. Nested processes of the same agent type collapse
-into one root entry. Hub aggregates these rosters and does not expand discovery.
+into one root entry. Claude Code's background-session plumbing is not an agent and is skipped when
+finding that root: a `claude` process whose first argument is `daemon`,
+`bg-pty-host` or `bg-spare` is transparent, so each daemon-hosted session is
+rostered, and receives its own hooks, under its own pid. This is the only
+place agentd reads a command line; it inspects the first argument and keeps
+nothing. Hub aggregates these rosters and does not expand discovery.
 
 Process identity is the pair of PID and Linux process start-time ticks. Optional
 activity claims enrich an existing record but never create or preserve one.

@@ -6,7 +6,7 @@ use crate::model::{
 use crate::tmux::{NoTmux, SystemTmux, TmuxSource};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,6 +22,13 @@ pub trait ProcfsView: Send + Sync {
     fn read_stat(&self, pid: u32) -> io::Result<String>;
     fn read_status(&self, pid: u32) -> io::Result<String>;
     fn read_cwd(&self, pid: u32) -> io::Result<PathBuf>;
+    fn read_cmdline(&self, pid: u32) -> io::Result<Vec<u8>> {
+        let _ = pid;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process cmdline unavailable",
+        ))
+    }
     fn read_system_stat(&self) -> io::Result<String> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -56,6 +63,14 @@ impl ProcfsView for FilesystemProcfs {
 
     fn read_cwd(&self, pid: u32) -> io::Result<PathBuf> {
         fs::read_link(self.root.join(pid.to_string()).join("cwd"))
+    }
+
+    fn read_cmdline(&self, pid: u32) -> io::Result<Vec<u8>> {
+        // Only argv[1] is ever inspected, and argv can run to megabytes.
+        let file = fs::File::open(self.root.join(pid.to_string()).join("cmdline"))?;
+        let mut bytes = Vec::new();
+        file.take(CMDLINE_PROBE_BYTES).read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 
     fn read_system_stat(&self) -> io::Result<String> {
@@ -130,6 +145,17 @@ impl ProcfsScanner {
         }
     }
 
+    /// `live_harness`, minus supervisors. argv is read, matched and dropped:
+    /// it is never kept on a record. A cmdline that cannot be read is not
+    /// evidence of a supervisor, so the process stays a candidate.
+    fn agent_harness(&self, stat: &StatRecord) -> Option<Harness> {
+        let harness = live_harness(stat)?;
+        match self.view.read_cmdline(stat.pid) {
+            Ok(cmdline) if is_supervisor(harness, &cmdline) => None,
+            _ => Some(harness),
+        }
+    }
+
     pub fn resolve_hook_root(
         &self,
         start_pid: u32,
@@ -152,7 +178,7 @@ impl ProcfsScanner {
             };
             let parent_pid = first.parent_pid;
 
-            if let Some(candidate_harness) = live_harness(&first) {
+            if let Some(candidate_harness) = self.agent_harness(&first) {
                 let effective_uid = self
                     .read_effective_uid(pid)
                     .map_err(|_| HookResolutionError::AncestryUnresolved)?;
@@ -264,7 +290,7 @@ impl ProcfsScanner {
 
         let mut validated = BTreeMap::<u32, (StatRecord, Harness, Option<String>)>::new();
         for first in first_reads.values() {
-            let Some(harness) = live_harness(first) else {
+            let Some(harness) = self.agent_harness(first) else {
                 continue;
             };
             let id = AgentId {
@@ -502,6 +528,20 @@ fn enumerate_pids(root: &Path) -> io::Result<Vec<u32>> {
     Ok(pids)
 }
 
+const CMDLINE_PROBE_BYTES: u64 = 4096;
+
+/// Claude Code hosts background sessions under processes that share the
+/// session's `comm` but are not agents: a supervisor, a pty host per session,
+/// and a pre-warmed spare. They never fire hooks, and treating one as the
+/// root hides every session beneath it behind a card that cannot resolve.
+fn is_supervisor(harness: Harness, cmdline: &[u8]) -> bool {
+    harness == Harness::Claude
+        && cmdline
+            .split(|byte| *byte == 0)
+            .nth(1)
+            .is_some_and(|arg| matches!(arg, b"daemon" | b"bg-pty-host" | b"bg-spare"))
+}
+
 fn live_harness(stat: &StatRecord) -> Option<Harness> {
     if stat.state == 'Z' {
         None
@@ -687,12 +727,37 @@ mod tests {
             }
             symlink(self.0.join("cwd-target"), cwd).unwrap();
         }
+
+        fn write_cmdline(&self, pid: u32, args: &[&str]) {
+            let mut bytes = Vec::new();
+            for arg in args {
+                bytes.extend_from_slice(arg.as_bytes());
+                bytes.push(0);
+            }
+            fs::write(self.0.join(pid.to_string()).join("cmdline"), bytes).unwrap();
+        }
     }
 
     impl Drop for TestProcfs {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The `claude --bg` tree captured on macpro on 2026-09-17.
+    fn write_daemon_tree(procfs: &TestProcfs) {
+        procfs.write_process(1, "systemd", 0, 0, 0);
+        procfs.write_process(1754, "claude", 1, 17_540, 1000);
+        procfs.write_cmdline(1754, &["/opt/claude", "daemon", "run", "--origin", "transient"]);
+        procfs.write_process(2383, "claude", 1754, 23_830, 1000);
+        procfs.write_cmdline(2383, &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/spare.sock"]);
+        procfs.write_process(2468, "claude", 2383, 24_680, 1000);
+        procfs.write_cmdline(2468, &["claude", "bg-spare", "--bg-spare", "/tmp/claim.sock"]);
+        procfs.write_process(2384, "claude", 1754, 23_840, 1000);
+        procfs.write_cmdline(2384, &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/pty.sock"]);
+        procfs.write_process(2473, "claude", 2384, 24_730, 1000);
+        procfs.write_cmdline(2473, &["/opt/claude", "--resume", "s.jsonl", "--name", "macpro-agent"]);
+        procfs.write_process(64_837, "bash", 2473, 648_370, 1000);
     }
 
     #[test]
@@ -704,6 +769,39 @@ mod tests {
         assert_eq!(parsed.state, 'S');
         assert_eq!(parsed.tty_nr, 0);
         assert_eq!(parsed.start_time_ticks, 99);
+    }
+
+    #[test]
+    fn supervisor_is_a_claude_process_whose_first_argument_names_one() {
+        assert!(is_supervisor(Harness::Claude, b"/opt/claude\0daemon\0run\0"));
+        assert!(is_supervisor(Harness::Claude, b"claude\0bg-pty-host\0--bg-pty-host\0/tmp/x.sock\0"));
+        assert!(is_supervisor(Harness::Claude, b"claude\0bg-spare\0"));
+        // A session that merely mentions the word, or passes it later, is a session.
+        assert!(!is_supervisor(Harness::Claude, b"claude\0--resume\0daemon\0"));
+        assert!(!is_supervisor(Harness::Claude, b"claude\0daemonize\0"));
+        assert!(!is_supervisor(Harness::Claude, b"claude\0"));
+        assert!(!is_supervisor(Harness::Claude, b""));
+        // The shapes are Claude Code's; another harness may use the word freely.
+        assert!(!is_supervisor(Harness::Codex, b"codex\0daemon\0"));
+    }
+
+    #[test]
+    fn agent_harness_drops_supervisors_and_keeps_everything_it_cannot_read() {
+        let procfs = TestProcfs::new("agent-harness");
+        procfs.write_process(10, "claude", 0, 100, 1000);
+        procfs.write_cmdline(10, &["claude", "daemon", "run"]);
+        procfs.write_process(11, "claude", 0, 110, 1000);
+        procfs.write_cmdline(11, &["claude", "--resume", "x.jsonl"]);
+        procfs.write_process(12, "claude", 0, 120, 1000);
+        procfs.write_process(13, "bash", 0, 130, 1000);
+        procfs.write_cmdline(13, &["bash", "daemon"]);
+        let scanner = procfs.scanner();
+        let stat = |pid| scanner.read_stat(pid).unwrap();
+        assert_eq!(scanner.agent_harness(&stat(10)), None);
+        assert_eq!(scanner.agent_harness(&stat(11)), Some(Harness::Claude));
+        // No cmdline file at all: unreadable means "not a supervisor".
+        assert_eq!(scanner.agent_harness(&stat(12)), Some(Harness::Claude));
+        assert_eq!(scanner.agent_harness(&stat(13)), None);
     }
 
     #[test]
@@ -848,6 +946,90 @@ mod tests {
                 pid: 610,
                 start_time_ticks: 6_100,
             })
+        );
+    }
+
+    #[test]
+    fn scanner_rosters_the_session_inside_a_daemon_tree_not_its_supervisors() {
+        let procfs = TestProcfs::new("daemon-tree-scan");
+        write_daemon_tree(&procfs);
+        // The fixture's init reports start time 0, which the scan may note as
+        // an issue; what is asserted here is the roster, not the scan state.
+        let proposal = procfs.scanner().scan(None, &FixedClock(1));
+        assert_eq!(
+            proposal
+                .agents
+                .iter()
+                .map(|agent| agent.id.pid)
+                .collect::<Vec<_>>(),
+            vec![2473]
+        );
+    }
+
+    #[test]
+    fn scanner_rosters_each_session_under_one_supervisor_separately() {
+        let procfs = TestProcfs::new("daemon-tree-two");
+        write_daemon_tree(&procfs);
+        procfs.write_process(2500, "claude", 1754, 25_000, 1000);
+        procfs.write_cmdline(2500, &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/pty2.sock"]);
+        procfs.write_process(2600, "claude", 2500, 26_000, 1000);
+        procfs.write_cmdline(2600, &["/opt/claude", "--resume", "voice.jsonl"]);
+        let proposal = procfs.scanner().scan(None, &FixedClock(1));
+        let mut pids = proposal
+            .agents
+            .iter()
+            .map(|agent| agent.id.pid)
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![2473, 2600]);
+    }
+
+    #[test]
+    fn hook_resolver_attributes_a_daemon_hosted_hook_to_its_session() {
+        let procfs = TestProcfs::new("daemon-tree-hook");
+        write_daemon_tree(&procfs);
+        assert_eq!(
+            procfs.scanner().resolve_hook_root(64_837, Harness::Claude),
+            Ok(AgentId {
+                pid: 2473,
+                start_time_ticks: 24_730,
+            })
+        );
+    }
+
+    #[test]
+    fn nested_claude_inside_a_daemon_hosted_session_still_collapses_into_it() {
+        let procfs = TestProcfs::new("daemon-tree-nested");
+        write_daemon_tree(&procfs);
+        procfs.write_process(3000, "claude", 64_837, 30_000, 1000);
+        procfs.write_cmdline(3000, &["claude", "-p", "summarise"]);
+        procfs.write_process(3001, "bash", 3000, 30_010, 1000);
+        assert_eq!(
+            procfs.scanner().resolve_hook_root(3001, Harness::Claude),
+            Ok(AgentId {
+                pid: 2473,
+                start_time_ticks: 24_730,
+            })
+        );
+        let proposal = procfs.scanner().scan(None, &FixedClock(1));
+        assert_eq!(
+            proposal
+                .agents
+                .iter()
+                .map(|agent| agent.id.pid)
+                .collect::<Vec<_>>(),
+            vec![2473]
+        );
+    }
+
+    #[test]
+    fn a_hook_fired_under_nothing_but_supervisors_resolves_to_no_agent() {
+        let procfs = TestProcfs::new("daemon-tree-orphan");
+        write_daemon_tree(&procfs);
+        procfs.write_process(7000, "bash", 2383, 70_000, 1000);
+        assert_eq!(
+            procfs.scanner().resolve_hook_root(7000, Harness::Claude),
+            Err(HookResolutionError::AncestryUnresolved)
         );
     }
 
