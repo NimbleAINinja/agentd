@@ -539,12 +539,18 @@ const CMDLINE_PROBE_BYTES: u64 = 4096;
 /// session's `comm` but are not agents: a supervisor, a pty host per session,
 /// and a pre-warmed spare. They never fire hooks, and treating one as the
 /// root hides every session beneath it behind a card that cannot resolve.
+/// The pty host and spare rewrite their process title, so argv[0] reads
+/// `claude bg-pty-host`; what argv[1] carries is the flag `--bg-pty-host` /
+/// `--bg-spare`, not the bare word. The bare words are kept in case the
+/// title rewrite ever goes away.
 fn is_supervisor(harness: Harness, cmdline: &[u8]) -> bool {
     harness == Harness::Claude
-        && cmdline
-            .split(|byte| *byte == 0)
-            .nth(1)
-            .is_some_and(|arg| matches!(arg, b"daemon" | b"bg-pty-host" | b"bg-spare"))
+        && cmdline.split(|byte| *byte == 0).nth(1).is_some_and(|arg| {
+            matches!(
+                arg,
+                b"daemon" | b"--bg-pty-host" | b"--bg-spare" | b"bg-pty-host" | b"bg-spare"
+            )
+        })
 }
 
 fn live_harness(stat: &StatRecord) -> Option<Harness> {
@@ -760,17 +766,28 @@ mod tests {
         procfs.write_process(2383, "claude", 1754, 23_830, 1000);
         procfs.write_cmdline(
             2383,
-            &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/spare.sock"],
+            &[
+                "claude bg-pty-host",
+                "--bg-pty-host",
+                "/tmp/spare.sock",
+                "200",
+                "50",
+                "--",
+            ],
         );
         procfs.write_process(2468, "claude", 2383, 24_680, 1000);
-        procfs.write_cmdline(
-            2468,
-            &["claude", "bg-spare", "--bg-spare", "/tmp/claim.sock"],
-        );
+        procfs.write_cmdline(2468, &["claude bg-spare", "--bg-spare", "/tmp/claim.sock"]);
         procfs.write_process(2384, "claude", 1754, 23_840, 1000);
         procfs.write_cmdline(
             2384,
-            &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/pty.sock"],
+            &[
+                "claude bg-pty-host",
+                "--bg-pty-host",
+                "/tmp/pty.sock",
+                "200",
+                "50",
+                "--",
+            ],
         );
         procfs.write_process(2473, "claude", 2384, 24_730, 1000);
         procfs.write_cmdline(
@@ -808,6 +825,16 @@ mod tests {
             b"claude\0bg-pty-host\0--bg-pty-host\0/tmp/x.sock\0"
         ));
         assert!(is_supervisor(Harness::Claude, b"claude\0bg-spare\0"));
+        // The pty host and spare rewrite their process title, so argv[0]
+        // reads e.g. "claude bg-pty-host" and argv[1] carries the flag.
+        assert!(is_supervisor(
+            Harness::Claude,
+            b"claude bg-pty-host\0--bg-pty-host\0/tmp/x.sock\x00200\x0050\0--\0"
+        ));
+        assert!(is_supervisor(
+            Harness::Claude,
+            b"claude bg-spare\0--bg-spare\0/tmp/x.claim.sock\0"
+        ));
         // A session that merely mentions the word, or passes it later, is a session.
         assert!(!is_supervisor(
             Harness::Claude,
@@ -1023,7 +1050,14 @@ mod tests {
         procfs.write_process(2500, "claude", 1754, 25_000, 1000);
         procfs.write_cmdline(
             2500,
-            &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/pty2.sock"],
+            &[
+                "claude bg-pty-host",
+                "--bg-pty-host",
+                "/tmp/pty2.sock",
+                "200",
+                "50",
+                "--",
+            ],
         );
         procfs.write_process(2600, "claude", 2500, 26_000, 1000);
         procfs.write_cmdline(2600, &["/opt/claude", "--resume", "voice.jsonl"]);

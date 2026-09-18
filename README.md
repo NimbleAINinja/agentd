@@ -111,7 +111,8 @@ Agentd. It does not list in-process subagents or agents hosted inside another
 program as separate agents. Nested processes of the same agent type collapse
 into one root entry. Claude Code's background-session plumbing is not an agent and is skipped when
 finding that root: a `claude` process whose first argument is `daemon`,
-`bg-pty-host` or `bg-spare` is transparent, so each daemon-hosted session is
+`--bg-pty-host` or `--bg-spare` (the pty host and spare rewrite their title,
+so the bare words are accepted too) is transparent, so each daemon-hosted session is
 rostered, and receives its own hooks, under its own pid. This is the only
 place agentd reads a command line; it inspects the first argument and keeps
 nothing. Hub aggregates these rosters and does not expand discovery.
