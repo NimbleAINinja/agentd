@@ -150,6 +150,11 @@ impl ProcfsScanner {
     /// evidence of a supervisor, so the process stays a candidate.
     fn agent_harness(&self, stat: &StatRecord) -> Option<Harness> {
         let harness = live_harness(stat)?;
+        // Only Claude Code has supervisor shapes to look for; do not spend a
+        // read on a codex or opencode process that cannot be one.
+        if harness != Harness::Claude {
+            return Some(harness);
+        }
         match self.view.read_cmdline(stat.pid) {
             Ok(cmdline) if is_supervisor(harness, &cmdline) => None,
             _ => Some(harness),
@@ -748,15 +753,36 @@ mod tests {
     fn write_daemon_tree(procfs: &TestProcfs) {
         procfs.write_process(1, "systemd", 0, 0, 0);
         procfs.write_process(1754, "claude", 1, 17_540, 1000);
-        procfs.write_cmdline(1754, &["/opt/claude", "daemon", "run", "--origin", "transient"]);
+        procfs.write_cmdline(
+            1754,
+            &["/opt/claude", "daemon", "run", "--origin", "transient"],
+        );
         procfs.write_process(2383, "claude", 1754, 23_830, 1000);
-        procfs.write_cmdline(2383, &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/spare.sock"]);
+        procfs.write_cmdline(
+            2383,
+            &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/spare.sock"],
+        );
         procfs.write_process(2468, "claude", 2383, 24_680, 1000);
-        procfs.write_cmdline(2468, &["claude", "bg-spare", "--bg-spare", "/tmp/claim.sock"]);
+        procfs.write_cmdline(
+            2468,
+            &["claude", "bg-spare", "--bg-spare", "/tmp/claim.sock"],
+        );
         procfs.write_process(2384, "claude", 1754, 23_840, 1000);
-        procfs.write_cmdline(2384, &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/pty.sock"]);
+        procfs.write_cmdline(
+            2384,
+            &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/pty.sock"],
+        );
         procfs.write_process(2473, "claude", 2384, 24_730, 1000);
-        procfs.write_cmdline(2473, &["/opt/claude", "--resume", "s.jsonl", "--name", "macpro-agent"]);
+        procfs.write_cmdline(
+            2473,
+            &[
+                "/opt/claude",
+                "--resume",
+                "s.jsonl",
+                "--name",
+                "macpro-agent",
+            ],
+        );
         procfs.write_process(64_837, "bash", 2473, 648_370, 1000);
     }
 
@@ -773,16 +799,37 @@ mod tests {
 
     #[test]
     fn supervisor_is_a_claude_process_whose_first_argument_names_one() {
-        assert!(is_supervisor(Harness::Claude, b"/opt/claude\0daemon\0run\0"));
-        assert!(is_supervisor(Harness::Claude, b"claude\0bg-pty-host\0--bg-pty-host\0/tmp/x.sock\0"));
+        assert!(is_supervisor(
+            Harness::Claude,
+            b"/opt/claude\0daemon\0run\0"
+        ));
+        assert!(is_supervisor(
+            Harness::Claude,
+            b"claude\0bg-pty-host\0--bg-pty-host\0/tmp/x.sock\0"
+        ));
         assert!(is_supervisor(Harness::Claude, b"claude\0bg-spare\0"));
         // A session that merely mentions the word, or passes it later, is a session.
-        assert!(!is_supervisor(Harness::Claude, b"claude\0--resume\0daemon\0"));
+        assert!(!is_supervisor(
+            Harness::Claude,
+            b"claude\0--resume\0daemon\0"
+        ));
         assert!(!is_supervisor(Harness::Claude, b"claude\0daemonize\0"));
         assert!(!is_supervisor(Harness::Claude, b"claude\0"));
         assert!(!is_supervisor(Harness::Claude, b""));
         // The shapes are Claude Code's; another harness may use the word freely.
         assert!(!is_supervisor(Harness::Codex, b"codex\0daemon\0"));
+        // The probe reads at most CMDLINE_PROBE_BYTES; an argv[0] that fills
+        // the whole window leaves no argv[1] to match.
+        assert!(!is_supervisor(
+            Harness::Claude,
+            &[b'x'; CMDLINE_PROBE_BYTES as usize]
+        ));
+        let mut long = vec![b'x'; CMDLINE_PROBE_BYTES as usize];
+        long.extend_from_slice(b"\0daemon\0");
+        assert!(!is_supervisor(
+            Harness::Claude,
+            &long[..CMDLINE_PROBE_BYTES as usize]
+        ));
     }
 
     #[test]
@@ -795,6 +842,8 @@ mod tests {
         procfs.write_process(12, "claude", 0, 120, 1000);
         procfs.write_process(13, "bash", 0, 130, 1000);
         procfs.write_cmdline(13, &["bash", "daemon"]);
+        procfs.write_process(14, "codex", 0, 140, 1000);
+        procfs.write_cmdline(14, &["codex", "daemon"]);
         let scanner = procfs.scanner();
         let stat = |pid| scanner.read_stat(pid).unwrap();
         assert_eq!(scanner.agent_harness(&stat(10)), None);
@@ -802,6 +851,7 @@ mod tests {
         // No cmdline file at all: unreadable means "not a supervisor".
         assert_eq!(scanner.agent_harness(&stat(12)), Some(Harness::Claude));
         assert_eq!(scanner.agent_harness(&stat(13)), None);
+        assert_eq!(scanner.agent_harness(&stat(14)), Some(Harness::Codex));
     }
 
     #[test]
@@ -971,7 +1021,10 @@ mod tests {
         let procfs = TestProcfs::new("daemon-tree-two");
         write_daemon_tree(&procfs);
         procfs.write_process(2500, "claude", 1754, 25_000, 1000);
-        procfs.write_cmdline(2500, &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/pty2.sock"]);
+        procfs.write_cmdline(
+            2500,
+            &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/pty2.sock"],
+        );
         procfs.write_process(2600, "claude", 2500, 26_000, 1000);
         procfs.write_cmdline(2600, &["/opt/claude", "--resume", "voice.jsonl"]);
         let proposal = procfs.scanner().scan(None, &FixedClock(1));
